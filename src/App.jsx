@@ -92,7 +92,7 @@ function Connect({ onConnect, onDemo }) {
             </form>
             <div className="connect-divider"><span>или</span></div>
             <button type="button" className="demo-button" onClick={onDemo}><Sparkles size={17} /> Посмотреть демо без подключения <ArrowRight size={17} /></button>
-            <div className="privacy-note"><ShieldCheck size={17} /><span>Данные подключения хранятся только во временной памяти сервера, не в браузере.</span></div>
+            <div className="privacy-note"><ShieldCheck size={17} /><span>Токен используется сервером. В облачной версии сессия защищена шифрованием и HttpOnly cookie.</span></div>
           </div>
           <p className="support-link">Нет инстанса? <a href="https://console.green-api.com/" target="_blank" rel="noreferrer">Создать в GREEN-API <ExternalLink size={13} /></a></p>
         </section>

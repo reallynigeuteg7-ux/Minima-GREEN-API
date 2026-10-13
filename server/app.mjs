@@ -4,6 +4,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { resolve, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ApiError, validateConnection, greenRequest, normalizeHistory, normalizeNotification, normalizeChats, isPhone, isChatId } from './green-api.mjs';
+import { createSessionCodec } from './session.mjs';
 
 const DEFAULT_DIST = fileURLToPath(new URL('../dist/', import.meta.url));
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.webp': 'image/webp' };
@@ -14,6 +15,11 @@ function json(res, status, data) {
 }
 
 async function parseBody(req) {
+  if (req.body !== undefined) {
+    const text = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
+    if (text.length > 16384) throw new ApiError(413, 'Слишком большой запрос.');
+    try { return JSON.parse(text); } catch { throw new ApiError(400, 'Некорректный JSON.'); }
+  }
   let text = '';
   for await (const chunk of req) {
     text += chunk.toString('utf8');
@@ -38,8 +44,16 @@ async function staticPage(res, pathname, distDir) {
   res.end(content);
 }
 
-export function createApp({ fetchImpl = fetch, distDir = DEFAULT_DIST, serveStatic = false } = {}) {
+export function createHandler({ fetchImpl = fetch, distDir = DEFAULT_DIST, serveStatic = false, sessionSecret = process.env.SESSION_SECRET } = {}) {
   const sessions = new Map(); // Credentials live only in server RAM (no DB, no localStorage).
+  if (process.env.VERCEL && !sessionSecret) throw new Error('Configure SESSION_SECRET in Vercel before deploying.');
+  const codec = sessionSecret ? createSessionCodec(sessionSecret) : null;
+
+  function saveSession(req, res, sid, session) {
+    const secure = !!req.socket.encrypted || req.headers['x-forwarded-proto'] === 'https' || !!process.env.VERCEL;
+    const value = codec ? codec.encode({ ...session, sid }) : sid;
+    res.setHeader('Set-Cookie', `minima_sid=${value}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.max(0, Math.floor((session.expires - Date.now()) / 1000))}${secure ? '; Secure' : ''}`);
+  }
 
   function validateMessenger(settings) {
     if (settings?.typeInstance && settings.typeInstance !== 'whatsapp') {
@@ -62,8 +76,11 @@ export function createApp({ fetchImpl = fetch, distDir = DEFAULT_DIST, serveStat
 
   function currentSession(req) {
     const cookie = (req.headers.cookie || '').split(';').map(s => s.trim()).find(s => s.startsWith('minima_sid='));
-    const sid = cookie?.slice('minima_sid='.length);
-    const session = sid && sessions.get(sid);
+    const value = cookie?.slice('minima_sid='.length);
+    const decoded = codec ? codec.decode(value) : null;
+    const sid = codec ? decoded?.sid : value;
+    if (codec && !decoded) return null;
+    const session = codec ? decoded : sid && sessions.get(sid);
     if (!session) return null;
     if (session.expires <= Date.now()) { sessions.delete(sid); return null; }
     return { sid, session };
@@ -85,6 +102,7 @@ export function createApp({ fetchImpl = fetch, distDir = DEFAULT_DIST, serveStat
         auth.session.state = state?.stateInstance || 'unknown';
       }
       if (auth.session.state === 'authorized' && !auth.session.ready) await prepareSession(auth.session);
+      if (codec) saveSession(req, res, auth.sid, auth.session);
       return json(res, 200, { connected: auth.session.state === 'authorized', pending: auth.session.state !== 'authorized', stateInstance: auth.session.state, idInstance: auth.session.connection.idInstance });
     }
     if (path === '/api/session' && req.method === 'POST') {
@@ -98,15 +116,14 @@ export function createApp({ fetchImpl = fetch, distDir = DEFAULT_DIST, serveStat
       const old = currentSession(req);
       if (old) sessions.delete(old.sid);
       const sid = randomBytes(32).toString('hex');
-      sessions.set(sid, session);
-      const secure = !!req.socket.encrypted || req.headers['x-forwarded-proto'] === 'https';
-      res.setHeader('Set-Cookie', `minima_sid=${sid}; HttpOnly; SameSite=Lax; Path=/; Max-Age=43200${secure ? '; Secure' : ''}`);
+      if (!codec) sessions.set(sid, session);
+      saveSession(req, res, sid, session);
       return json(res, 200, { connected: session.state === 'authorized', pending: session.state !== 'authorized', stateInstance: session.state, idInstance: connection.idInstance });
     }
     if (path === '/api/logout' && req.method === 'POST') {
       const auth = currentSession(req);
       if (auth) sessions.delete(auth.sid);
-      res.setHeader('Set-Cookie', 'minima_sid=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');
+      res.setHeader('Set-Cookie', `minima_sid=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${req.socket.encrypted || req.headers['x-forwarded-proto'] === 'https' || process.env.VERCEL ? '; Secure' : ''}`);
       return json(res, 200, { connected: false });
     }
     const auth = currentSession(req);
@@ -168,12 +185,16 @@ export function createApp({ fetchImpl = fetch, distDir = DEFAULT_DIST, serveStat
     throw new ApiError(404, 'Маршрут не найден.');
   }
 
-  return createServer((req, res) => {
-    handle(req, res).catch(error => {
+  return (req, res) => {
+    return handle(req, res).catch(error => {
       if (res.headersSent) return res.end();
       const status = error instanceof ApiError ? error.status : 500;
       if (!(error instanceof ApiError)) console.error('[Server error]', error);
       json(res, status, { error: error instanceof ApiError ? error.message : 'Внутренняя ошибка сервера.' });
     });
-  });
+  };
+}
+
+export function createApp(options = {}) {
+  return createServer(createHandler(options));
 }
